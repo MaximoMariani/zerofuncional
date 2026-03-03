@@ -1,0 +1,499 @@
+openapi: 3.0.3
+info:
+  title: ZERO API
+  description: Sistema de armado de pedidos — endpoints internos
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:4000
+    description: Local development
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        pages: { type: integer }
+
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        email: { type: string }
+        role: { type: string, enum: [admin, operator, viewer] }
+        active: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    Order:
+      type: object
+      properties:
+        id: { type: integer }
+        external_id: { type: string, nullable: true }
+        customer_name: { type: string }
+        customer_email: { type: string, nullable: true }
+        status: { type: string, enum: [pending, in_progress, packed, cancelled] }
+        notes: { type: string, nullable: true }
+        assigned_to_name: { type: string, nullable: true }
+        total_items: { type: integer }
+        total_qty: { type: integer }
+        scanned_qty: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    OrderItem:
+      type: object
+      properties:
+        id: { type: integer }
+        order_id: { type: integer }
+        sku: { type: string }
+        barcode: { type: string, nullable: true }
+        name: { type: string }
+        quantity: { type: integer }
+        scanned_qty: { type: integer }
+        status: { type: string, enum: [pending, partial, complete] }
+
+    ScanResult:
+      type: object
+      properties:
+        item: { $ref: '#/components/schemas/OrderItem' }
+        allItemsComplete: { type: boolean }
+        orderStatus: { type: string }
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  db: { type: string }
+                  uptime: { type: number }
+        '503':
+          description: DB unavailable
+
+  /api/auth/login:
+    post:
+      summary: Login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 6 }
+      responses:
+        '200':
+          description: Tokens + user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accessToken: { type: string }
+                  refreshToken: { type: string }
+                  user: { $ref: '#/components/schemas/User' }
+        '401': { description: Invalid credentials }
+        '422': { description: Validation error }
+
+  /api/auth/refresh:
+    post:
+      summary: Refresh access token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200':
+          description: New tokens
+        '401': { description: Invalid/expired refresh token }
+
+  /api/auth/logout:
+    post:
+      summary: Logout (revoke refresh token)
+      responses:
+        '200': { description: Logged out }
+
+  /api/auth/me:
+    get:
+      summary: Get current user
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+
+  /api/orders:
+    get:
+      summary: List orders (paginated)
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20, maximum: 100 }
+        - in: query
+          name: status
+          schema: { type: string, enum: [pending, in_progress, packed, cancelled] }
+        - in: query
+          name: assignedTo
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Paginated orders
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Order' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+
+  /api/orders/{id}:
+    get:
+      summary: Get single order with items
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Order with items array
+        '404': { description: Not found }
+
+  /api/orders/{id}/pack:
+    patch:
+      summary: Mark order as packed
+      description: |
+        Validates all items are complete, updates status, writes audit log.
+        TIENDANUBE HOOK: after this, call TiendanubeClient.markPacked(external_id)
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        '200': { description: Order packed }
+        '404': { description: Order not found }
+        '409': { description: Already packed or has incomplete items }
+
+  /api/scans:
+    post:
+      summary: Process a barcode scan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderId, barcode]
+              properties:
+                orderId: { type: integer }
+                barcode: { type: string }
+      responses:
+        '200':
+          description: Scan result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScanResult' }
+        '404': { description: Barcode not found in order }
+        '409': { description: Item already fully scanned or order not in progress }
+
+  /api/users:
+    get:
+      summary: List users (admin only)
+      responses:
+        '200':
+          description: Users array
+    post:
+      summary: Create user (admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password]
+              properties:
+                name: { type: string }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8 }
+                role: { type: string, enum: [admin, operator, viewer], default: operator }
+      responses:
+        '201': { description: User created }
+        '409': { description: Email already exists }
+
+  /api/users/{id}:
+    patch:
+      summary: Update user (admin only)
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        '200': { description: Updated }
+        '404': { description: Not found }
+
+  /api/audit:
+    get:
+      summary: List audit logs (admin only)
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50 }
+        - in: query
+          name: userId
+          schema: { type: integer }
+        - in: query
+          name: action
+          schema: { type: string }
+        - in: query
+          name: entityType
+          schema: { type: string }
+      responses:
+        '200':
+          description: Paginated audit logs
+
+  # ── KPI endpoints ─────────────────────────────────────
+
+  /api/kpi/today:
+    get:
+      summary: Today's summary KPIs
+      parameters:
+        - in: query
+          name: date
+          schema: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$' }
+          description: Date override (default today)
+      responses:
+        '200':
+          description: Summary metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  date: { type: string }
+                  orders_packed_today: { type: integer }
+                  orders_pending: { type: integer }
+                  orders_in_progress: { type: integer }
+                  scans_ok_today: { type: integer }
+                  scans_error_today: { type: integer }
+                  scan_error_rate_pct: { type: number }
+                  avg_pack_time_seconds: { type: integer }
+                  avg_pack_time_display: { type: string }
+
+  /api/kpi/performance:
+    get:
+      summary: Hourly throughput and last 7 days
+      parameters:
+        - in: query
+          name: date
+          schema: { type: string }
+      responses:
+        '200':
+          description: Performance charts data
+
+  /api/kpi/operators:
+    get:
+      summary: Per-operator efficiency metrics
+      parameters:
+        - in: query
+          name: date
+          schema: { type: string }
+      responses:
+        '200':
+          description: Operator rankings
+
+  /api/kpi/errors:
+    get:
+      summary: Scan error breakdown and top missing SKUs
+      parameters:
+        - in: query
+          name: date
+          schema: { type: string }
+      responses:
+        '200':
+          description: Error analytics
+
+  # ── Location endpoints ────────────────────────────────
+
+  /api/locations:
+    get:
+      summary: List all warehouse locations
+      responses:
+        '200':
+          description: Array of warehouse locations
+    post:
+      summary: Create warehouse location (admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string, example: "A1" }
+                zone: { type: string, example: "Zona A" }
+                description: { type: string }
+      responses:
+        '201': { description: Location created }
+        '409': { description: Code already exists }
+
+  /api/locations/sku/{sku}:
+    get:
+      summary: Get warehouse location for a SKU
+      parameters:
+        - in: path
+          name: sku
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Location or null }
+
+  /api/locations/products/{sku}/location:
+    post:
+      summary: Assign SKU to a warehouse location
+      parameters:
+        - in: path
+          name: sku
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [locationId]
+              properties:
+                locationId: { type: integer }
+                stock: { type: integer }
+      responses:
+        '200': { description: Product location set }
+
+  # ── Exception endpoints ───────────────────────────────
+
+  /api/orders/{id}/events:
+    get:
+      summary: Get event log for an order
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Array of order_events ordered by occurred_at
+
+  /api/orders/{orderId}/items/{itemId}/missing:
+    post:
+      summary: Mark an item as missing (exception)
+      parameters:
+        - in: path
+          name: orderId
+          required: true
+          schema: { type: integer }
+        - in: path
+          name: itemId
+          required: true
+          schema: { type: integer }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                notes: { type: string, maxLength: 500 }
+      responses:
+        '200': { description: Item marked missing, event emitted }
+        '409': { description: Item already has exception }
+
+  /api/orders/{orderId}/items/{itemId}/replace:
+    post:
+      summary: Replace an item with another SKU
+      parameters:
+        - in: path
+          name: orderId
+          required: true
+          schema: { type: integer }
+        - in: path
+          name: itemId
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [replacementSku]
+              properties:
+                replacementSku: { type: string }
+                notes: { type: string }
+      responses:
+        '200': { description: Replacement registered }
+
+  /api/orders/{id}/supervisor-override:
+    post:
+      summary: Supervisor override — approve all exceptions (admin only)
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                notes: { type: string }
+      responses:
+        '200': { description: Override event emitted }

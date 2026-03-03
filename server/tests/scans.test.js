@@ -3,13 +3,13 @@
  */
 require('./helpers');
 const request = require('supertest');
-const app = require('../src/app');
+const app = require('../app');
 const { makeToken } = require('./helpers');
 
-jest.mock('../src/services/scanService', () => ({ processScan: jest.fn() }));
-jest.mock('../src/services/auditService', () => ({ audit: jest.fn() }));
+jest.mock('../services/scanService', () => ({ processScan: jest.fn() }));
+jest.mock('../services/auditService', () => ({ audit: jest.fn() }));
 
-const scanService = require('../src/services/scanService');
+const scanService = require('../services/scanService');
 const operatorToken = makeToken({ id: 2, role: 'operator' });
 const viewerToken = makeToken({ id: 3, role: 'viewer' });
 

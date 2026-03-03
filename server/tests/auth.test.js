@@ -3,17 +3,17 @@
  */
 require('./helpers');
 const request = require('supertest');
-const app = require('../src/app');
+const app = require('../app');
 
 // Mock DB and services to isolate from real DB
-jest.mock('../src/services/authService', () => ({
+jest.mock('../services/authService', () => ({
   login: jest.fn(),
   refresh: jest.fn(),
   logout: jest.fn(),
 }));
-jest.mock('../src/services/auditService', () => ({ audit: jest.fn() }));
+jest.mock('../services/auditService', () => ({ audit: jest.fn() }));
 
-const authService = require('../src/services/authService');
+const authService = require('../services/authService');
 
 describe('POST /api/auth/login', () => {
   it('returns 422 on missing fields', async () => {

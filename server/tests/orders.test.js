@@ -3,17 +3,17 @@
  */
 require('./helpers');
 const request = require('supertest');
-const app = require('../src/app');
+const app = require('../app');
 const { makeToken } = require('./helpers');
 
-jest.mock('../src/services/orderService', () => ({
+jest.mock('../services/orderService', () => ({
   list: jest.fn(),
   getById: jest.fn(),
   markPacked: jest.fn(),
 }));
-jest.mock('../src/services/auditService', () => ({ audit: jest.fn() }));
+jest.mock('../services/auditService', () => ({ audit: jest.fn() }));
 
-const orderService = require('../src/services/orderService');
+const orderService = require('../services/orderService');
 
 const adminToken = makeToken({ id: 1, role: 'admin' });
 const viewerToken = makeToken({ id: 3, role: 'viewer' });

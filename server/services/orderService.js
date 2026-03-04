@@ -1,258 +1,199 @@
 const db = require('../db');
 const { createError } = require('../middleware/errorHandler');
-const { audit } = require('./auditService');
-const { emit } = require('./eventService');
-const { getLocationsBySkus } = require('./locationService');
+const logger = require('../utils/logger');
 
-/**
- * List orders with pagination.
- */
-async function list({ page = 1, limit = 20, status, assignedTo } = {}) {
+// ── Helpers ────────────────────────────────────────────────────
+function withItemProgress(orders, itemSummaries) {
+  const map = Object.fromEntries(itemSummaries.map((s) => [s.order_id, s]));
+  return orders.map((o) => ({
+    ...o,
+    total_qty:   Number(map[o.id]?.total_qty   ?? 0),
+    scanned_qty: Number(map[o.id]?.scanned_qty ?? 0),
+    total_items: Number(map[o.id]?.total_items ?? 0),
+  }));
+}
+
+async function attachProgress(orderIds) {
+  if (!orderIds.length) return [];
+  return db('order_items')
+    .whereIn('order_id', orderIds)
+    .select('order_id')
+    .sum('qty as total_qty')
+    .sum('scanned_qty as scanned_qty')
+    .count('id as total_items')
+    .groupBy('order_id');
+}
+
+// ── List ───────────────────────────────────────────────────────
+async function list({ status, search, page = 1, limit = 30 } = {}) {
   const offset = (page - 1) * limit;
-
-  let q = db('orders as o')
-    .leftJoin('users as u', 'o.assigned_to', 'u.id')
-    .select(
-      'o.id', 'o.external_id', 'o.customer_name', 'o.customer_email',
-      'o.status', 'o.notes', 'o.created_at', 'o.updated_at',
-      'u.name as assigned_to_name'
-    )
-    .orderBy('o.created_at', 'desc')
-    .limit(limit)
-    .offset(offset);
-
-  if (status) q = q.where('o.status', status);
-  if (assignedTo) q = q.where('o.assigned_to', assignedTo);
-
+  let q = db('orders').orderBy('created_at', 'desc').limit(limit).offset(offset);
+  if (status) q = q.where('status', status);
+  if (search) {
+    q = q.where((b) =>
+      b.whereILike('tn_order_number', `%${search}%`)
+       .orWhereILike('customer_name', `%${search}%`)
+       .orWhereILike('shipping_label_code', `%${search}%`)
+    );
+  }
   const countQ = db('orders');
   if (status) countQ.where('status', status);
-  const [{ total }] = await countQ.count('id as total');
-  const rows = await q;
+  if (search) {
+    countQ.where((b) =>
+      b.whereILike('tn_order_number', `%${search}%`)
+       .orWhereILike('customer_name', `%${search}%`)
+       .orWhereILike('shipping_label_code', `%${search}%`)
+    );
+  }
 
-  // Avoid N+1: attach item summary + exception counts
-  const orderIds = rows.map((r) => r.id);
-  const itemSummaries = orderIds.length > 0
-    ? await db('order_items')
-        .whereIn('order_id', orderIds)
-        .select('order_id')
-        .count('id as total_items')
-        .sum('quantity as total_qty')
-        .sum('scanned_qty as scanned_qty')
-        .count(db.raw('CASE WHEN exception_status IS NOT NULL THEN 1 END as exceptions'))
-        .groupBy('order_id')
-    : [];
-
-  const summaryMap = Object.fromEntries(itemSummaries.map((s) => [s.order_id, s]));
-
-  const data = rows.map((r) => ({
-    ...r,
-    total_items: Number(summaryMap[r.id]?.total_items ?? 0),
-    total_qty: Number(summaryMap[r.id]?.total_qty ?? 0),
-    scanned_qty: Number(summaryMap[r.id]?.scanned_qty ?? 0),
-    exceptions: Number(summaryMap[r.id]?.exceptions ?? 0),
-  }));
-
+  const [rows, [{ count }]] = await Promise.all([q, countQ.count('id as count')]);
+  const summaries = await attachProgress(rows.map((r) => r.id));
   return {
-    data,
-    pagination: { page, limit, total: Number(total), pages: Math.ceil(total / limit) },
+    data: withItemProgress(rows, summaries),
+    pagination: { page, limit, total: Number(count), pages: Math.ceil(count / limit) },
   };
 }
 
-/**
- * Get a single order with all items + warehouse locations.
- */
-async function getById(orderId) {
-  const order = await db('orders as o')
-    .leftJoin('users as u', 'o.assigned_to', 'u.id')
-    .select('o.*', 'u.name as assigned_to_name')
-    .where('o.id', orderId)
-    .first();
-
+// ── Get by id / number / label ─────────────────────────────────
+async function getById(id) {
+  const order = await db('orders').where({ id }).first();
   if (!order) throw createError(404, 'Order not found');
-
-  const items = await db('order_items').where({ order_id: orderId }).orderBy('id');
-
-  // Attach warehouse locations (one query for all skus)
-  const skus = [...new Set(items.map((i) => i.sku))];
-  const locationMap = await getLocationsBySkus(skus);
-
-  const itemsWithLocation = items.map((item) => ({
-    ...item,
-    location: locationMap[item.sku] || null,
-  }));
-
-  return { ...order, items: itemsWithLocation };
+  const items = await db('order_items').where({ order_id: id }).orderBy('id');
+  const [summary] = await attachProgress([id]);
+  const scans = await db('scan_events').where({ order_id: id }).orderBy('created_at', 'desc').limit(50);
+  return { ...order, items, scans, ...summary };
 }
 
-/**
- * Mark an order as packed.
- * Allows packing with exceptions (missing/replaced items) — fires ORDER_PARTIAL.
- * Full pack → ORDER_PACKED.
- *
- * NOTE FOR TIENDANUBE INTEGRATION:
- * After updating local status, call TiendanubeClient.markPacked(order.external_id)
- * if INTEGRATION_PROVIDER === 'tiendanube'.
- * See /src/integrations/tiendanube/client.js
- */
-async function markPacked(orderId, userId, ipAddress) {
+async function getByNumber(tn_order_number) {
+  const order = await db('orders').where({ tn_order_number }).first();
+  if (!order) throw createError(404, `Order #${tn_order_number} not found`);
+  return getById(order.id);
+}
+
+async function getByLabel(labelCode) {
+  const order = await db('orders')
+    .whereILike('shipping_label_code', labelCode.trim())
+    .first();
+  if (!order) throw createError(404, `No order with label code "${labelCode}"`);
+  return getById(order.id);
+}
+
+// ── Scan item ──────────────────────────────────────────────────
+async function scanItem(orderId, scannedCode, userId) {
   return db.transaction(async (trx) => {
     const order = await trx('orders').where({ id: orderId }).first();
     if (!order) throw createError(404, 'Order not found');
     if (order.status === 'packed') throw createError(409, 'Order is already packed');
-    if (order.status === 'cancelled') throw createError(409, 'Cannot pack a cancelled order');
+    if (order.status === 'cancelled') throw createError(409, 'Order is cancelled');
 
-    // Items that are neither complete nor have an exception are truly blocking
-    const blockingItems = await trx('order_items')
+    const code = scannedCode.trim();
+
+    // Match by barcode first, then by sku
+    const item = await trx('order_items')
       .where({ order_id: orderId })
-      .whereNot('status', 'complete')
-      .whereNull('exception_status');
+      .where((b) => b.where('barcode', code).orWhere('sku', code))
+      .first();
 
-    if (blockingItems.length > 0) {
-      throw createError(422, `Order has ${blockingItems.length} item(s) not yet scanned or marked as exception`);
+    if (!item) {
+      await trx('scan_events').insert({ order_id: orderId, user_id: userId, scanned_code: code, result: 'unexpected' });
+      await trx('order_events').insert({ order_id: orderId, user_id: userId, type: 'ITEM_SCANNED', meta: JSON.stringify({ code, result: 'unexpected' }) });
+      throw createError(422, `Code "${code}" not found in this order`);
     }
 
-    // Determine if partial (has any exception items)
-    const exceptionItems = await trx('order_items')
-      .where({ order_id: orderId })
-      .whereNotNull('exception_status');
+    if (item.scanned_qty >= item.qty) {
+      await trx('scan_events').insert({ order_id: orderId, user_id: userId, scanned_code: code, result: 'duplicate', order_item_id: item.id });
+      throw createError(409, `Item "${item.name}" already fully scanned (${item.qty}/${item.qty})`);
+    }
 
-    const isPartial = exceptionItems.length > 0;
-    const eventType = isPartial ? 'ORDER_PARTIAL' : 'ORDER_PACKED';
+    const newScanned = item.scanned_qty + 1;
+    await trx('order_items').where({ id: item.id }).update({ scanned_qty: newScanned, updated_at: new Date() });
+    await trx('scan_events').insert({ order_id: orderId, user_id: userId, scanned_code: code, result: 'ok', order_item_id: item.id });
+    await trx('order_events').insert({ order_id: orderId, user_id: userId, type: 'ITEM_SCANNED', meta: JSON.stringify({ code, item_id: item.id, sku: item.sku, scanned: newScanned, required: item.qty }) });
 
-    await trx('orders').where({ id: orderId }).update({ status: 'packed', updated_at: db.fn.now() });
+    // Check if all items complete → auto-pack
+    const pending = await trx('order_items').where({ order_id: orderId }).whereRaw('scanned_qty < qty');
+    const allDone = pending.length === 0;
 
-    await emit({
-      orderId,
-      userId,
-      eventType,
-      payload: { exceptions: exceptionItems.length, previous_status: order.status },
-      trx,
-    });
+    if (allDone) {
+      await trx('orders').where({ id: orderId }).update({ status: 'packed', packed_by: userId, packed_at: new Date(), updated_at: new Date() });
+      await trx('order_events').insert({ order_id: orderId, user_id: userId, type: 'ORDER_PACKED', meta: JSON.stringify({ auto: true }) });
+    }
 
-    await audit({
-      userId,
-      action: 'order.packed',
-      entityType: 'order',
-      entityId: orderId,
-      metadata: { previous_status: order.status, partial: isPartial, exceptions: exceptionItems.length },
-      ipAddress,
-      trx,
-    });
-
-    return { ...order, status: 'packed', partial: isPartial };
+    return {
+      item: { ...item, scanned_qty: newScanned },
+      allDone,
+      order_status: allDone ? 'packed' : 'pending',
+    };
   });
 }
 
-/**
- * Mark an item as missing.
- */
-async function markItemMissing(orderId, itemId, userId, notes, ipAddress) {
-  return db.transaction(async (trx) => {
-    const item = await trx('order_items').where({ id: itemId, order_id: orderId }).first();
-    if (!item) throw createError(404, 'Item not found in this order');
-    if (item.exception_status) throw createError(409, `Item already has exception: ${item.exception_status}`);
-
-    await trx('order_items').where({ id: itemId }).update({
-      exception_status: 'missing',
-      exception_note: notes || null,
-      status: 'complete', // treated as resolved for packing purposes
-      updated_at: db.fn.now(),
-    });
-
-    await emit({
-      orderId,
-      itemId,
-      userId,
-      eventType: 'ITEM_MISSING',
-      payload: { sku: item.sku, name: item.name },
-      notes: notes || null,
-      trx,
-    });
-
-    await audit({
-      userId,
-      action: 'item.missing',
-      entityType: 'order',
-      entityId: orderId,
-      metadata: { item_id: itemId, sku: item.sku },
-      ipAddress,
-      trx,
-    });
-
-    return { ...item, exception_status: 'missing', exception_note: notes || null };
-  });
+// ── Admin override pack ────────────────────────────────────────
+async function packOrder(orderId, userId) {
+  const order = await db('orders').where({ id: orderId }).first();
+  if (!order) throw createError(404, 'Order not found');
+  if (order.status === 'packed') throw createError(409, 'Already packed');
+  await db('orders').where({ id: orderId }).update({ status: 'packed', packed_by: userId, packed_at: new Date(), updated_at: new Date() });
+  await db('order_events').insert({ order_id: orderId, user_id: userId, type: 'ORDER_PACKED', meta: JSON.stringify({ auto: false, admin_override: true }) });
+  return { ...order, status: 'packed' };
 }
 
-/**
- * Replace an item with a different SKU.
- */
-async function replaceItem(orderId, itemId, userId, { replacementSku, notes }, ipAddress) {
-  return db.transaction(async (trx) => {
-    const item = await trx('order_items').where({ id: itemId, order_id: orderId }).first();
-    if (!item) throw createError(404, 'Item not found in this order');
-    if (item.exception_status) throw createError(409, `Item already has exception: ${item.exception_status}`);
+// ── Upsert from integration ────────────────────────────────────
+async function upsertFromTN(tnOrder) {
+  const existing = await db('orders').where({ tn_order_id: String(tnOrder.id) }).first();
 
-    await trx('order_items').where({ id: itemId }).update({
-      exception_status: 'replaced',
-      replacement_sku: replacementSku,
-      exception_note: notes || null,
-      status: 'complete',
-      updated_at: db.fn.now(),
-    });
+  const orderData = {
+    tn_order_id:         String(tnOrder.id),
+    tn_order_number:     String(tnOrder.number),
+    status:              tnOrder.payment_status === 'paid' && tnOrder.shipping_status !== 'delivered' ? 'pending' : existing?.status || 'pending',
+    customer_name:       [tnOrder.customer?.name, tnOrder.customer?.lastname].filter(Boolean).join(' ') || 'Unknown',
+    customer_email:      tnOrder.customer?.email || null,
+    shipping_provider:   tnOrder.shipping?.provider?.name || null,
+    shipping_label_code: tnOrder.shipping?.tracking_number || null,
+    tn_created_at:       tnOrder.created_at ? new Date(tnOrder.created_at) : null,
+    tn_updated_at:       tnOrder.updated_at ? new Date(tnOrder.updated_at) : null,
+    updated_at:          new Date(),
+  };
 
-    await emit({
-      orderId,
-      itemId,
-      userId,
-      eventType: 'ITEM_REPLACED',
-      payload: { original_sku: item.sku, replacement_sku: replacementSku },
-      notes: notes || null,
-      trx,
-    });
+  let orderId;
+  if (existing) {
+    // Don't overwrite packed status
+    if (existing.status !== 'packed') {
+      await db('orders').where({ id: existing.id }).update(orderData);
+    } else {
+      await db('orders').where({ id: existing.id }).update({ tn_updated_at: orderData.tn_updated_at, updated_at: new Date() });
+    }
+    orderId = existing.id;
+  } else {
+    const [row] = await db('orders').insert({ ...orderData, created_at: new Date() }).returning('id');
+    orderId = typeof row === 'object' ? row.id : row;
+  }
 
-    await audit({
-      userId,
-      action: 'item.replaced',
-      entityType: 'order',
-      entityId: orderId,
-      metadata: { item_id: itemId, original_sku: item.sku, replacement_sku: replacementSku },
-      ipAddress,
-      trx,
-    });
+  // Upsert items (only if not packed)
+  const currentOrder = await db('orders').where({ id: orderId }).first();
+  if (currentOrder.status !== 'packed' && tnOrder.products?.length > 0) {
+    // Delete old items and re-insert (simpler than diff)
+    const existingItems = await db('order_items').where({ order_id: orderId });
+    if (!existingItems.length) {
+      const items = tnOrder.products.map((p) => ({
+        order_id: orderId,
+        sku:     p.sku || String(p.product_id),
+        barcode: p.barcode || null,
+        name:    p.name,
+        variant: p.variant?.values?.map((v) => v.es || v.en).join(' / ') || null,
+        qty:     p.quantity,
+        scanned_qty: 0,
+      }));
+      await db('order_items').insert(items);
+    }
+  }
 
-    return { ...item, exception_status: 'replaced', replacement_sku: replacementSku };
+  await db('order_events').insert({
+    order_id: orderId,
+    type: 'ORDER_SYNCED',
+    meta: JSON.stringify({ tn_id: tnOrder.id, tn_number: tnOrder.number }),
   });
+
+  return orderId;
 }
 
-/**
- * Supervisor override — approve all pending exceptions on an order.
- */
-async function supervisorOverride(orderId, userId, notes, ipAddress) {
-  return db.transaction(async (trx) => {
-    const order = await trx('orders').where({ id: orderId }).first();
-    if (!order) throw createError(404, 'Order not found');
-
-    await emit({
-      orderId,
-      userId,
-      eventType: 'SUPERVISOR_OVERRIDE',
-      payload: { order_status: order.status },
-      notes: notes || null,
-      trx,
-    });
-
-    await audit({
-      userId,
-      action: 'order.supervisor_override',
-      entityType: 'order',
-      entityId: orderId,
-      metadata: { notes },
-      ipAddress,
-      trx,
-    });
-
-    return { orderId, approved: true };
-  });
-}
-
-module.exports = { list, getById, markPacked, markItemMissing, replaceItem, supervisorOverride };
+module.exports = { list, getById, getByNumber, getByLabel, scanItem, packOrder, upsertFromTN };

@@ -1,24 +1,29 @@
 const express = require('express');
-const db = require('../db');
-
 const router = express.Router();
 
-router.get('/', async (_req, res) => {
-  let dbOk = false;
+// ── Healthcheck ─────────────────────────────────────────────────
+// MUST respond 200 immediately — no DB calls, no async, no dependencies.
+// Railway probes this path right after process start. Any delay or 5xx
+// here causes "1/1 replicas never became healthy".
+//
+// DB health is checked separately at /health/full (authenticated, internal).
+router.get('/', (_req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    uptime: Math.floor(process.uptime()),
+    ts: Date.now(),
+  });
+});
+
+// Detailed check for internal monitoring (not used by Railway healthcheck)
+router.get('/full', async (_req, res) => {
+  const db = require('../db');
   try {
     await db.raw('SELECT 1');
-    dbOk = true;
-  } catch (_err) {
-    // db unreachable
+    return res.json({ status: 'ok', db: 'ok', uptime: Math.floor(process.uptime()) });
+  } catch (err) {
+    return res.status(503).json({ status: 'error', db: 'unreachable', detail: err.message });
   }
-
-  const status = dbOk ? 200 : 503;
-  return res.status(status).json({
-    status: dbOk ? 'ok' : 'degraded',
-    db: dbOk ? 'ok' : 'error',
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-  });
 });
 
 module.exports = router;

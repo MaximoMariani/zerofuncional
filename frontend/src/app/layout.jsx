@@ -1,15 +1,13 @@
 import './globals.css';
+import { AuthProvider } from '../lib/auth';
 
-export const metadata = {
-  title: 'ZERO — Armado de Pedidos',
-  description: 'Sistema de armado de pedidos con escaneo de código de barras',
-};
+export const metadata = { title: 'ZERO — Order Packing', description: 'Warehouse order packing system' };
 
 export default function RootLayout({ children }) {
   return (
     <html lang="es">
-      <body className="bg-gray-50 text-gray-900 antialiased">
-        {children}
+      <body>
+        <AuthProvider>{children}</AuthProvider>
       </body>
     </html>
   );

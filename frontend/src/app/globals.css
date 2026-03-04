@@ -2,8 +2,5 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Custom focus ring */
-:focus-visible {
-  outline: 2px solid #2563eb;
-  outline-offset: 2px;
-}
+html { font-family: system-ui, -apple-system, sans-serif; }
+body { @apply bg-gray-50 text-gray-900; }

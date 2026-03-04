@@ -1,86 +1,108 @@
-/**
- * ─────────────────────────────────────────────────────────────────
- *  TIENDANUBE INTEGRATION — CLIENT MOCK
- *  ⚠️  ALL METHODS ARE STUBS. This file returns mock/empty data.
- *
- *  PROGRAMMER: To integrate Tiendanube:
- *  1. Set INTEGRATION_PROVIDER=tiendanube in your .env
- *  2. Add TIENDANUBE_STORE_ID and TIENDANUBE_ACCESS_TOKEN to .env
- *  3. Replace each method body with real fetch() calls to:
- *       https://api.tiendanube.com/v1/{store_id}/orders
- *     Ref: https://tiendanube.github.io/api-documentation/resources/order
- *  4. Map TiendanubeOrder → local Order shape in mapOrder() below
- * ─────────────────────────────────────────────────────────────────
- */
+const fetch = require('node-fetch');
+const db = require('../../db');
+const { encrypt, decrypt } = require('../../utils/crypto');
+const logger = require('../../utils/logger');
 
-class TiendanubeClient {
-  constructor() {
-    this.storeId = process.env.TIENDANUBE_STORE_ID || '';
-    this.accessToken = process.env.TIENDANUBE_ACCESS_TOKEN || '';
-    this.baseUrl = `https://api.tiendanube.com/v1/${this.storeId}`;
-  }
+const TN_API  = 'https://api.tiendanube.com/v1';
+const TN_AUTH = 'https://www.tiendanube.com/apps';
 
-  /**
-   * Fetch orders from Tiendanube.
-   * STUB — returns empty array.
-   *
-   * @param {{ page?: number, per_page?: number, status?: string }} params
-   * @returns {Promise<import('./types').TiendanubeOrder[]>}
-   *
-   * PROGRAMMER: Implement like:
-   *   const res = await fetch(`${this.baseUrl}/orders?page=${params.page}&per_page=${params.per_page}`, {
-   *     headers: { 'Authentication': `bearer ${this.accessToken}` }
-   *   });
-   *   return res.json();
-   */
-  // eslint-disable-next-line no-unused-vars
-  async fetchOrders(_params = {}) {
-    // TODO: implement real Tiendanube API call
-    return [];
-  }
+// ── OAuth ──────────────────────────────────────────────────────
 
-  /**
-   * Mark an order as packed/fulfilled in Tiendanube.
-   * STUB — does nothing.
-   *
-   * @param {number|string} orderId — Tiendanube external order id
-   * @returns {Promise<void>}
-   *
-   * PROGRAMMER: Implement like:
-   *   await fetch(`${this.baseUrl}/orders/${orderId}/fulfill`, {
-   *     method: 'POST',
-   *     headers: {
-   *       'Authentication': `bearer ${this.accessToken}`,
-   *       'Content-Type': 'application/json',
-   *     },
-   *   });
-   */
-  // eslint-disable-next-line no-unused-vars
-  async markPacked(_orderId) {
-    // TODO: implement real Tiendanube API call
-  }
-
-  /**
-   * Map a Tiendanube order to the local ZERO order shape.
-   * PROGRAMMER: Adjust field mapping to match actual API response.
-   *
-   * @param {import('./types').TiendanubeOrder} tnOrder
-   * @returns {object} local order shape
-   */
-  mapOrder(tnOrder) {
-    return {
-      external_id: String(tnOrder.id),
-      customer_name: tnOrder.customer?.name || 'Unknown',
-      customer_email: tnOrder.customer?.email || null,
-      status: 'pending',
-      items: (tnOrder.products || []).map((p) => ({
-        sku: p.sku || String(p.id),
-        barcode: p.barcode || null,
-        name: p.name,
-        quantity: p.quantity,
-      })),
-    };
-  }
+function getAuthUrl(state = '') {
+  const params = new URLSearchParams({
+    client_id:     process.env.TIENDANUBE_CLIENT_ID,
+    response_type: 'code',
+    scope:         'write_orders read_orders',
+    state,
+  });
+  return `${TN_AUTH}/${process.env.TIENDANUBE_CLIENT_ID}/authorize?${params}`;
 }
 
-module.exports = new TiendanubeClient();
+async function exchangeCode(code) {
+  const res = await fetch(`${TN_AUTH}/authorize/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_id:     process.env.TIENDANUBE_CLIENT_ID,
+      client_secret: process.env.TIENDANUBE_CLIENT_SECRET,
+      grant_type:    'authorization_code',
+      code,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`TN token exchange failed: ${res.status} ${body}`);
+  }
+  return res.json(); // { access_token, token_type, scope, user_id }
+}
+
+// ── Token storage ──────────────────────────────────────────────
+
+async function saveTokens({ access_token, user_id, storeName }) {
+  await db('store_config').where({ id: 1 }).update({
+    provider:            'tiendanube',
+    tn_store_id:         String(user_id),
+    tn_store_name:       storeName || null,
+    tn_access_token_enc: encrypt(access_token),
+    updated_at:          new Date(),
+  });
+}
+
+async function getToken() {
+  const cfg = await db('store_config').where({ id: 1 }).first();
+  if (!cfg?.tn_access_token_enc) throw new Error('Tiendanube not connected. Visit /admin/integrations/tiendanube');
+  return { token: decrypt(cfg.tn_access_token_enc), storeId: cfg.tn_store_id };
+}
+
+// ── API calls ──────────────────────────────────────────────────
+
+async function tnFetch(path, options = {}) {
+  const { token, storeId } = await getToken();
+  const url = `${TN_API}/${storeId}${path}`;
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      'Authentication': `bearer ${token}`,
+      'User-Agent':     `ZERO/2.0 (${process.env.TIENDANUBE_CLIENT_ID})`,
+      'Content-Type':   'application/json',
+      ...options.headers,
+    },
+  });
+  if (res.status === 401) throw new Error('Tiendanube token expired or invalid. Re-authorize in /admin/integrations/tiendanube');
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`TN API ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
+async function fetchOrders({ limit = 50, page = 1, since_id } = {}) {
+  const params = new URLSearchParams({ per_page: limit, page });
+  if (since_id) params.set('since_id', since_id);
+  return tnFetch(`/orders?${params}`);
+}
+
+async function fetchOrder(tnOrderId) {
+  return tnFetch(`/orders/${tnOrderId}`);
+}
+
+async function getStoreInfo() {
+  return tnFetch('/');
+}
+
+// ── Status ─────────────────────────────────────────────────────
+
+async function getStatus() {
+  const cfg = await db('store_config').where({ id: 1 }).first();
+  if (!cfg) return { connected: false };
+  const connected = cfg.provider === 'tiendanube' && !!cfg.tn_access_token_enc;
+  return {
+    connected,
+    provider:      cfg.provider,
+    tn_store_id:   cfg.tn_store_id,
+    tn_store_name: cfg.tn_store_name,
+    last_sync_at:  cfg.last_sync_at,
+  };
+}
+
+module.exports = { getAuthUrl, exchangeCode, saveTokens, fetchOrders, fetchOrder, getStoreInfo, getStatus };
